@@ -1,0 +1,141 @@
+import groovy.text.StreamingTemplateEngine
+
+import java.util.function.BinaryOperator
+
+Map<String, ?> loadConfig(path) {
+  def file = file(path)
+  if (!file.exists()) {
+    return new ConfigObject()
+  }
+  if (!file.directory) {
+    return new ConfigSlurper().parse(file.getText("UTF-8"))
+  }
+
+  def configs = []
+  file
+    .listFiles(new FileFilter() {
+      boolean accept(File f) { return !f.directory && !f.name.startsWith(".") }
+    })
+    .sort { it.name }
+    .each {
+      logger.info("### load config path: ${path}/${it.name}")
+      configs.add(new ConfigSlurper().parse(it.getText("UTF-8")))
+    }
+
+  return configs.stream().reduce(new BinaryOperator() {
+    @Override
+    Object apply( o1, Object o2) {
+      return o1.merge(o2)
+    }
+  }).get()
+}
+
+class ExpandConfigReader extends Reader {
+  private Reader original
+  @Delegate
+  private Reader output
+
+  ExpandConfigReader(Reader original) {
+    this.original = new BufferedReader(original)
+  }
+
+  void setProperties(Map<String, ?> properties) {
+    try {
+      this.output = new StringReader(
+        new StreamingTemplateEngine()
+          .createTemplate(this.original)
+          .make(properties)
+          .writeTo(new StringWriter())
+          .toString()
+          .replace('\\$', '$')
+      )
+    }
+    finally {
+      this.original.close()
+    }
+  }
+}
+
+class ExpandConfigFilterReader extends FilterReader {
+  ExpandConfigFilterReader(Reader reader) {
+    super(new ExpandConfigReader(reader))
+  }
+
+  void setProperties(Map<String, ?> properties) {
+    this.in.properties = properties
+  }
+}
+
+def printConfig(config) {
+  println "\n##### config values #####"
+  config.each {e -> println e}
+}
+
+def configDir = file('config')
+def templateDir = file('config/template')
+def buildTarget = file("${project.buildDir}/config/")
+
+task expandConfig(type: Copy, group: 'build', description: 'expand default config files from config/template') {
+  def configParams = loadConfig(configDir.path)
+  configParams.merge(loadConfig("${System.properties['user.home']}/.calico/${project.name}/"))
+  configParams.putAll(project: project, generated: new Date())
+
+  from templateDir
+  into buildTarget
+  rename '[.]tpl$', ''
+  filter([properties: configParams], ExpandConfigFilterReader)
+
+  filteringCharset = 'UTF-8'
+
+  doLast {
+    printConfig(configParams)
+    fileTree(buildTarget).files.each {f ->
+      def rel = buildTarget.toPath().relativize(f.toPath())
+      def target = project.rootDir.toPath().resolve(rel).toFile()
+      if (target.exists()) {
+        target.delete()
+      }
+      else {
+        target.parentFile.mkdirs()
+      }
+      f.renameTo(target)
+    }
+  }
+
+  outputs.upToDateWhen { false }
+}
+
+configDir.toPath().resolve("env").toFile().listFiles().each {env ->
+  if (!env.isFile()) return
+  def envName = env.name.split('[.]')[0]
+
+  task "expand${envName.capitalize()}Config"(type: Copy, group: 'build', description: "expand config as ${envName} files from config/template") {
+    def configParams = loadConfig('config/')
+    configParams.merge(loadConfig(env.path))
+    configParams.putAll(project: project, generated: new Date())
+
+    from templateDir
+    into buildTarget
+    rename '[.]tpl$', ''
+    filter([properties: configParams], ExpandConfigFilterReader)
+
+    filteringCharset = 'UTF-8'
+
+    doLast {
+      printConfig(configParams)
+      fileTree(buildTarget).files.each {f ->
+        def rel = buildTarget.toPath().relativize(f.toPath())
+        def target = project.rootDir.toPath().resolve(rel).toFile()
+        if (target.exists()) {
+          target.delete()
+        }
+        else {
+          target.parentFile.mkdirs()
+        }
+        f.renameTo(target)
+      }
+    }
+
+    outputs.upToDateWhen { false }
+  }
+}
